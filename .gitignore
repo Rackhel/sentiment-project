@@ -1,0 +1,39 @@
+# Python virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Spark checkpoint & streaming metadata
+output/checkpoint/
+output/sentiment_results/
+
+# Keep the output folder itself but not generated files
+!output/.gitkeep
+
+# Spark event logs & temp files
+spark-warehouse/
+derby.log
+metastore_db/
+*.log
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# VS Code settings
+.vscode/
+
+# Environment variables
+.env
+
+# macOS / Windows junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Java
+*.class
+*.jar
