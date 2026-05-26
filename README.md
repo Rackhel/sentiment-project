@@ -1,7 +1,7 @@
 # Real-Time Social Media Sentiment Analytics System
 
-**Student:** Rackhel Fernando L.B.
-**Student ID:** 202312229
+**Student:** Rackhel Fernando L.B. & Sheikh MD Sifat
+**Student ID:** 202312229 , 202312254
 **Course:** Big Data Platform — Spring 2026
 
 ---
