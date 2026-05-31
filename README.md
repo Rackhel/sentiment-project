@@ -197,12 +197,23 @@ level set to ERROR to suppress. Does not affect pipeline results.
 Raw tweet-level records saved to `output/sentiment_results/`
 with columns: tweet, timestamp, sentiment.
 
+![Console Output](screenshots/results.png)
+
 ### Live Dashboard
 Streamlit dashboard at http://localhost:8501 — auto-refreshes every 5s.
+
+![Console Output](screenshots/Overall_Running.png)
+
+### Visualization
+Static chart from visualize.py, `output/sentiment_chart.png`. 
+
+![Console Output](output/sentiment_chart.png)
 
 ### Log file
 Structured log at `pipeline.log` — INFO/WARNING/ERROR entries for
 every pipeline event, including all spike alerts.
+
+![Console Output](screenshots/logs.png)
 
 ---
 
