@@ -1,9 +1,18 @@
+"""
+spark_consumer.py — Enhanced for Final Presentation
+Reads JSON from Kafka, classifies sentiment, outputs:
+  - compound_score  (raw VADER float, e.g. 0.743)
+  - sentiment       (positive / negative / neutral)
+  - topic           (tech / sports / weather / food / work)
+to CSV, console, and an alert engine.
+"""
+
 import logging
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import udf, window, col, current_timestamp
-from pyspark.sql.types import StringType
+from pyspark.sql.functions import udf, window, col, current_timestamp, from_json
+from pyspark.sql.types import StringType, FloatType, StructType, StructField
 
-# --- Logging setup ---
+# ── Logging setup ────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -14,7 +23,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("SentimentStream")
 
-# --- Sentiment classifier with error handling ---
+# ── VADER setup ───────────────────────────────────────────────────────────────
 try:
     from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
     _analyzer = SentimentIntensityAnalyzer()
@@ -23,10 +32,21 @@ except ImportError as e:
     log.error(f"Failed to import vaderSentiment: {e}")
     raise
 
+# ── UDFs ──────────────────────────────────────────────────────────────────────
+def get_compound(text):
+    """Return raw VADER compound score (float -1.0 to +1.0)."""
+    try:
+        if not text or text.strip() == "":
+            return 0.0
+        return float(_analyzer.polarity_scores(text)['compound'])
+    except Exception as e:
+        log.warning(f"Compound score error for '{str(text)[:50]}': {e}")
+        return 0.0
+
 def classify_sentiment(text):
     """Classify tweet sentiment using VADER compound score."""
     try:
-        if text is None or text.strip() == "":
+        if not text or text.strip() == "":
             return "neutral"
         score = _analyzer.polarity_scores(text)['compound']
         if score >= 0.05:
@@ -36,12 +56,21 @@ def classify_sentiment(text):
         else:
             return "neutral"
     except Exception as e:
-        log.warning(f"Sentiment classification error for text '{text[:50]}': {e}")
+        log.warning(f"Sentiment classification error for '{str(text)[:50]}': {e}")
         return "neutral"
 
-sentiment_udf = udf(classify_sentiment, StringType())
+compound_udf  = udf(get_compound,        FloatType())
+sentiment_udf = udf(classify_sentiment,  StringType())
 
-# --- Spark Session ---
+# ── JSON schema ───────────────────────────────────────────────────────────────
+# Producer now sends: {"tweet": "...", "topic": "tech", "source": "simulated"}
+json_schema = StructType([
+    StructField("tweet",  StringType(), True),
+    StructField("topic",  StringType(), True),
+    StructField("source", StringType(), True),
+])
+
+# ── Spark Session ─────────────────────────────────────────────────────────────
 try:
     spark = SparkSession.builder \
         .appName("SentimentStream") \
@@ -54,7 +83,7 @@ except Exception as e:
     log.critical(f"Failed to start Spark session: {e}")
     raise
 
-# --- Read from Kafka ---
+# ── Read from Kafka ───────────────────────────────────────────────────────────
 try:
     raw_stream = spark.readStream \
         .format("kafka") \
@@ -67,61 +96,75 @@ except Exception as e:
     log.critical(f"Failed to connect to Kafka: {e}")
     raise
 
-# --- Parse and classify ---
-tweets_df = raw_stream.selectExpr("CAST(value AS STRING) as tweet") \
-    .withColumn("timestamp", current_timestamp()) \
-    .withColumn("sentiment", sentiment_udf(col("tweet")))
+# ── Parse JSON + enrich ───────────────────────────────────────────────────────
+parsed = raw_stream \
+    .selectExpr("CAST(value AS STRING) as raw_json") \
+    .select(from_json(col("raw_json"), json_schema).alias("data")) \
+    .select(
+        col("data.tweet").alias("tweet"),
+        col("data.topic").alias("topic"),
+        col("data.source").alias("source"),
+    )
 
-# --- Windowed sentiment counts (10-second tumbling window) ---
-windowed = tweets_df \
+tweets_df = parsed \
+    .withColumn("timestamp",      current_timestamp()) \
+    .withColumn("compound_score", compound_udf(col("tweet"))) \
+    .withColumn("sentiment",      sentiment_udf(col("tweet")))
+
+# ── Windowed counts (by sentiment) ───────────────────────────────────────────
+windowed_sentiment = tweets_df \
     .groupBy(
         window(col("timestamp"), "10 seconds"),
         col("sentiment")
     ).count() \
     .orderBy("window", "sentiment")
 
-# --- Alerting: track negative counts per window via foreachBatch ---
-ALERT_THRESHOLD = 10  # alert if negative tweets >= this in a 10-sec window
+# ── Windowed counts (by topic) ────────────────────────────────────────────────
+windowed_topic = tweets_df \
+    .groupBy(
+        window(col("timestamp"), "10 seconds"),
+        col("topic")
+    ).count() \
+    .orderBy("window", "topic")
+
+# ── Alert engine ──────────────────────────────────────────────────────────────
+ALERT_THRESHOLD = 10
 
 def alert_on_negative_spike(batch_df, batch_id):
-    """Check each micro-batch for negative sentiment spikes and alert."""
+    """Fire an alert when a 10-sec window has ≥ ALERT_THRESHOLD negative tweets."""
     try:
         rows = batch_df.collect()
         for row in rows:
-            sentiment = row["sentiment"]
-            count = row["count"]
-            window_start = row["window"]["start"].strftime("%H:%M:%S")
-            window_end   = row["window"]["end"].strftime("%H:%M:%S")
-            if sentiment == "negative" and count >= ALERT_THRESHOLD:
-                log.warning(
-                    f"🚨 ALERT [{window_start}–{window_end}] "
-                    f"Negative spike detected: {count} negative tweets "
-                    f"(threshold: {ALERT_THRESHOLD})"
+            if row["sentiment"] == "negative" and row["count"] >= ALERT_THRESHOLD:
+                ws = row["window"]["start"].strftime("%H:%M:%S")
+                we = row["window"]["end"].strftime("%H:%M:%S")
+                msg = (
+                    f"🚨 ALERT [{ws}–{we}] "
+                    f"Negative spike: {row['count']} tweets (threshold: {ALERT_THRESHOLD})"
                 )
-                print(
-                    f"\n🚨 NEGATIVE SPIKE ALERT [{window_start}–{window_end}]: "
-                    f"{count} negative tweets in this window!\n"
-                )
+                log.warning(msg)
+                print(f"\n{msg}\n")
     except Exception as e:
         log.error(f"Alert check failed for batch {batch_id}: {e}")
 
-# --- Output to console ---
-console_query = windowed.writeStream \
+# ── Output: console (sentiment counts) ───────────────────────────────────────
+console_query = windowed_sentiment.writeStream \
     .outputMode("complete") \
     .format("console") \
     .option("truncate", False) \
     .trigger(processingTime="10 seconds") \
     .start()
 
-# --- Alert query (foreachBatch on windowed counts) ---
-alert_query = windowed.writeStream \
+# ── Output: alert engine ──────────────────────────────────────────────────────
+alert_query = windowed_sentiment.writeStream \
     .outputMode("complete") \
     .foreachBatch(alert_on_negative_spike) \
     .trigger(processingTime="10 seconds") \
     .start()
 
-# --- Output to CSV (raw tweet level) ---
+# ── Output: CSV (tweet-level, with compound_score + topic) ───────────────────
 csv_query = tweets_df \
+    .select("tweet", "topic", "source", "timestamp", "compound_score", "sentiment") \
     .writeStream \
     .outputMode("append") \
     .format("csv") \
@@ -132,8 +175,9 @@ csv_query = tweets_df \
     .start()
 
 log.info("📡 All stream queries started. Listening for tweets... (Ctrl+C to stop)")
-print("\n📡 Listening for tweets... (Ctrl+C to stop)\n")
-print(f"   🚨 Negative spike alert threshold: {ALERT_THRESHOLD} tweets / 10-sec window\n")
+print("\n📡 Listening for tweets... (Ctrl+C to stop)")
+print(f"   Columns written: tweet | topic | source | timestamp | compound_score | sentiment")
+print(f"   🚨 Alert threshold: {ALERT_THRESHOLD} negative tweets / 10-sec window\n")
 
 try:
     spark.streams.awaitAnyTermination()
